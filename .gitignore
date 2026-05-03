@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+
+# Alembic generated versions (optional – keep if you want migration history)
+# alembic/versions/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# uv
+.python-version
+
+# Docker
+*.override.yml
+
+# Distribution / packaging
+*.whl
+*.tar.gz
+MANIFEST
+
+# Jupyter (if any notebooks are present)
+.ipynb_checkpoints/
+
+# ReportLab temp files
+*.pdf
