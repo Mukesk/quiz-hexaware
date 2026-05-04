@@ -1,6 +1,6 @@
-# 📚 Hexaware Quiz Auto-Evaluation Backend
+# 📚Quiz Auto-Evaluation Backend
 
-> **AI-powered adaptive quiz evaluation platform built for Hexaware's Learning & Development program**
+> **AI-powered adaptive quiz evaluation platform built for Learning & Development program**
 
 ## 🧭 Overview
 
