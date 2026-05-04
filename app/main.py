@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import questions, quiz
+from app.routers import reports
 
 app = FastAPI(
     title="Quiz Auto-Evaluation Backend",
@@ -22,3 +23,4 @@ async def health_check():
 
 app.include_router(questions.router)
 app.include_router(quiz.router)
+app.include_router(reports.router)

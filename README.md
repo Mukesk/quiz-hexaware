@@ -14,26 +14,32 @@ The project strictly follows a layered **Router → Service → Repository → M
 app/
 ├── routers/          # HTTP layer: Route definitions, request parsing, response formatting
 │   ├── questions.py  # CRUD + AI generation endpoints
-│   └── quiz.py       # Quiz session lifecycle endpoints
+│   ├── quiz.py       # Quiz session lifecycle endpoints
+│   └── reports.py    # Question report + AI agent review endpoints
 ├── services/         # Business logic layer (pure Python, no DB calls)
 │   ├── ai_gen_service.py     # GPT-4o-mini question generation
 │   ├── evaluation_service.py # Adaptive answer evaluation logic
 │   ├── question_service.py   # Question fetching (Redis → DB → AI fallback)
-│   └── score_service.py      # Score computation and caching
+│   ├── score_service.py      # Score computation and caching
+│   ├── report_service.py     # Report submission (non-blocking) + human override
+│   └── review_agent.py       # LangChain agent with 3 tools for claim verification
 ├── repositories/     # Database access layer (SQLAlchemy async queries)
 │   ├── answer_repo.py
 │   ├── question_repo.py
+│   ├── report_repo.py
 │   └── session_repo.py
 ├── models/           # SQLAlchemy ORM models (DB schema)
 │   ├── user.py
 │   ├── question.py
 │   ├── quiz_session.py   # Also contains AIGenLog
+│   ├── question_report.py
 │   ├── course.py
 │   └── week.py
 ├── schemas/          # Pydantic v2 schemas (request/response validation)
 ├── tasks/            # FastAPI BackgroundTasks (async, no separate worker)
 │   ├── pdf_task.py       # PDF report generation → stored in PostgreSQL
-│   └── feedback_task.py  # AI feedback generation via GPT-4o-mini
+│   ├── feedback_task.py  # AI feedback generation via GPT-4o-mini
+│   └── review_task.py    # LangChain agent review + DB replace/edit/reject
 ├── auth/             # JWT authentication + RBAC
 │   └── dependencies.py
 ├── utils/            # Pure utility functions
@@ -54,7 +60,8 @@ app/
 | **ORM** | SQLAlchemy 2.0 (async) |
 | **Schema Migrations** | Alembic (async-compatible) |
 | **Caching** | Redis (aioredis) |
-| **AI** | OpenAI GPT-4o-mini |
+| **AI - Generation** | OpenAI GPT-4o-mini (direct) |
+| **AI - Agent Review** | LangChain 0.3 + ChatOpenAI |
 | **LLM Observability** | LangSmith (traces all AI calls) |
 | **Authentication** | JWT (python-jose) |
 | **Password Hashing** | Passlib + Bcrypt |
@@ -126,7 +133,27 @@ ai_gen_log
 ├── prompt_used, raw_response
 ├── tokens_used, cost_usd
 └── created_at
+
+question_reports                      ← NEW (Module 4)
+├── id (UUID PK)
+├── question_id (FK → questions)
+├── session_id  (FK → quiz_sessions)
+├── reported_by (FK → users)
+├── reason          → wrong_answer | wrong_question | ambiguous | outdated | other
+├── student_note
+├── status          → pending | agent_reviewing | valid_replaced | valid_edited | rejected | human_override
+├── agent_verdict   → agent's reasoning text
+├── agent_confidence → Numeric(4,2) — 0.00 to 1.00
+├── replacement_q_id (FK → questions) → set when agent replaces
+├── reviewed_by (FK → users)
+├── reviewer_note
+├── created_at, resolved_at
 ```
+
+> **`questions` table additions (Module 4)**
+> - `is_active BOOLEAN DEFAULT true` — `False` when a question is archived after replacement
+> - `replaced_by UUID` — FK to the new question that replaced this one
+> - `report_count INT DEFAULT 0` — incremented each time a student flags the question
 
 ## 🔐 Authentication & RBAC
 
@@ -134,9 +161,9 @@ All routes are protected by **JWT Bearer tokens**. The `require_role()` dependen
 
 | Role | Permissions |
 |---|---|
-| `student` | Start/continue quiz, submit answers, view own results |
-| `instructor` | CRUD questions, generate AI questions, view all results |
-| `admin` | Full access |
+| `student` | Start/continue quiz, submit answers, view own results, **report questions** |
+| `instructor` | CRUD questions, generate AI questions, view all results, view/override reports |
+| `admin` | Full access including report stats |
 | `reviewer` | Review and approve AI-generated questions |
 
 ## 🔄 Quiz Lifecycle
@@ -207,6 +234,17 @@ Accuracy is always computed in Python — **LLMs are never used for scoring**.
 | `POST` | `/quiz/submit` | student | Finalize quiz + get score |
 | `GET` | `/quiz/result/{session_id}` | student/instructor | Get score report |
 | `GET` | `/quiz/report/{session_id}/pdf` | student/instructor | Download PDF report |
+| `POST` | `/quiz/report` | student | 🆕 Flag a question as wrong/unclear |
+| `GET` | `/quiz/report/my` | student | 🆕 View own submitted reports |
+
+### Question Reports API (`/questions/reports`) — NEW
+| Method | Endpoint | Role | Description |
+|---|---|---|---|
+| `GET` | `/questions/reports` | instructor/admin | List all reports (filterable by status) |
+| `GET` | `/questions/reports/{id}` | instructor/admin | Single report detail |
+| `PATCH` | `/questions/reports/{id}/override` | instructor/admin | Human reviewer override |
+| `GET` | `/questions/{id}/reports` | instructor/admin | All reports for a question |
+| `GET` | `/questions/reports/stats` | admin | Aggregate stats by reason/status |
 
 ### Health
 | Method | Endpoint | Description |
@@ -294,6 +332,9 @@ docker-compose exec api alembic upgrade head
 | **PDF stored in PostgreSQL BYTEA** | Eliminates AWS S3 dependency; keeps the stack self-contained |
 | **FastAPI BackgroundTasks over Celery** | Simpler deployment with no worker process; runs in the same async event loop |
 | **Adaptive difficulty per subtopic** | More granular than session-level difficulty; prevents one weak topic from skewing difficulty for strong areas |
+| **`is_active` filter on all question queries** | Single filter ensures replaced/archived questions are never served to any student without touching any other logic |
+| **Agent confidence threshold of 0.75** | Rejects borderline cases — LLM is only trusted when highly confident, human reviewer can always override |
+| **Non-blocking report pipeline** | `POST /quiz/report` returns 200 in < 500ms; agent runs in background so quiz session is never interrupted |
 
 ## 📂 Project Structure (Full)
 
@@ -305,28 +346,35 @@ quiz_backend/
 │   ├── models/
 │   │   ├── course.py
 │   │   ├── question.py
+│   │   ├── question_report.py        ← NEW
 │   │   ├── quiz_session.py   (+ AIGenLog)
 │   │   ├── user.py
 │   │   └── week.py
 │   ├── repositories/
 │   │   ├── answer_repo.py
 │   │   ├── question_repo.py
+│   │   ├── report_repo.py            ← NEW
 │   │   └── session_repo.py
 │   ├── routers/
 │   │   ├── questions.py
-│   │   └── quiz.py
+│   │   ├── quiz.py
+│   │   └── reports.py               ← NEW
 │   ├── schemas/
 │   │   ├── question.py
 │   │   ├── quiz.py
+│   │   ├── report.py                ← NEW
 │   │   └── score.py
 │   ├── services/
 │   │   ├── ai_gen_service.py
 │   │   ├── evaluation_service.py
 │   │   ├── question_service.py
+│   │   ├── report_service.py        ← NEW
+│   │   ├── review_agent.py          ← NEW
 │   │   └── score_service.py
 │   ├── tasks/
 │   │   ├── feedback_task.py
-│   │   └── pdf_task.py
+│   │   ├── pdf_task.py
+│   │   └── review_task.py           ← NEW
 │   ├── utils/
 │   │   ├── adaptive.py
 │   │   └── metrics.py
@@ -337,11 +385,58 @@ quiz_backend/
 ├── alembic/
 │   ├── env.py
 │   └── versions/
+│       ├── ce9032ddd241_initial_schema.py
+│       └── 073ada4209be_add_question_reports.py  ← NEW
 ├── tests/
+│   ├── unit/
+│   │   └── test_review_agent.py     ← NEW
+│   ├── integration/
+│   │   └── test_report_flow.py      ← NEW
 │   └── conftest.py
 ├── seed_users.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 └── .env
+
+---
+
+## 🤖 Module 4 — Question Report & AI Agent Review
+
+### Overview
+Students can flag questions as wrong, ambiguous, or outdated during a live quiz. A **LangChain AI agent** autonomously verifies the report, decides whether to edit/replace/reject the question, and updates the database — all **without blocking the student's quiz session**.
+
+### End-to-End Flow
+```
+1. POST /quiz/report         → Student flags question (returns 200 immediately)
+2. BackgroundTask fires      → review_question_report(report_id, redis) starts async
+3. Agent fetches Q + report  → Sets status to 'agent_reviewing'
+4. Agent verifies claim      → verify_claim tool (confidence 0–1)
+5. Agent decides:
+   ├── confidence >= 0.75 + wrong_answer  → edit_question_fields   → 'valid_edited'
+   ├── confidence >= 0.75 + broken Q      → generate_replacement   → 'valid_replaced'
+   └── confidence < 0.75  or baseless     → reject                 → 'rejected'
+6. If replaced: old Q archived (is_active=False), new Q inserted, Redis cache cleared
+7. Student's next question fetch gets new Q transparently
+8. Human reviewer can always override via PATCH /questions/reports/{id}/override
+```
+
+### LangChain Agent Tools
+| Tool | Purpose |
+|---|---|
+| `verify_claim` | Analyses whether the student's complaint is factually valid |
+| `generate_replacement_question` | Creates a corrected replacement (preserves topic/difficulty/type) |
+| `edit_question_fields` | Patches specific fields in-place (for minor fixes like wrong `correct_answer`) |
+
+### Agent Decision Matrix
+| Scenario | Action | DB Effect |
+|---|---|---|
+| `wrong_answer` + confidence ≥ 0.75 | `edit` | Fix `correct_answer` + `explanation` in place |
+| `wrong_question` + confidence ≥ 0.75 | `replace` | Archive original, insert new, clear Redis cache |
+| `ambiguous` + confidence ≥ 0.75 | `replace` | Generate clearer question on same topic |
+| Any reason + confidence < 0.75 | `reject` | Question unchanged; human can still override |
+| Agent parse error | `rejected` | Error logged; report marked rejected |
+
+### Key Invariant
+> Every `get_by_id()` and `get_bank_ids()` filters `is_active=True`. This single condition ensures replaced/archived questions are **never served to any student, in any session**, with no additional logic changes anywhere else in the codebase.
 ```

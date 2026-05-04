@@ -19,7 +19,13 @@ class QuestionRepository:
         return question
 
     async def get_by_id(self, question_id: uuid.UUID, db: AsyncSession) -> Optional[Question]:
-        result = await db.execute(select(Question).where(Question.id == question_id, Question.deleted_at.is_(None)))
+        result = await db.execute(
+            select(Question).where(
+                Question.id == question_id,
+                Question.deleted_at.is_(None),
+                Question.is_active == True,   # KEY INVARIANT: never serve replaced questions
+            )
+        )
         return result.scalar_one_or_none()
 
     async def update(self, question_id: uuid.UUID, data: dict, db: AsyncSession) -> Optional[Question]:
@@ -41,9 +47,19 @@ class QuestionRepository:
             .where(Question.difficulty == difficulty)
             .where(Question.deleted_at.is_(None))
             .where(Question.reviewed == True)
+            .where(Question.is_active == True)   # KEY INVARIANT: never serve replaced questions
             .order_by(func.random())
         )
         return [str(row) for row in result.scalars().all()]
+
+    async def increment_report_count(self, question_id: uuid.UUID, db: AsyncSession) -> None:
+        from sqlalchemy import text
+        await db.execute(
+            update(Question)
+            .where(Question.id == question_id)
+            .values(report_count=Question.report_count + 1)
+        )
+        await db.commit()
         
     async def get_paginated(self, skip: int, limit: int, db: AsyncSession) -> List[Question]:
         result = await db.execute(
